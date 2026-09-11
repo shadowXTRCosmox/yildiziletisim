@@ -1,65 +1,72 @@
-import socket
-import threading
+import asyncio
+import websockets
 import json
+import os
 
-# Online kullanıcılar: { "kullanici_adi": { "socket": conn, "pub_key": pem_bytes } }
-clients = {}
+# Bağlı istemcileri ve açık anahtarlarını saklayan sözlük
+CLIENTS = {}
 
-def handle_client(conn, addr):
+async def handler(websocket):
     username = None
     try:
-        # 1. Kayıt El Sıkışması (Kullanıcı adı ve Public Key al)
-        init_data = conn.recv(4096).decode('utf-8')
-        payload = json.loads(init_data)
-        username = payload["username"]
-        pub_key_pem = payload["pub_key"]
+        # 1. Bağlantı ilk kurulduğunda kayıt bilgisini al
+        init_data_raw = await websocket.recv()
+        init_data = json.loads(init_data_raw)
+        
+        username = init_data.get("username")
+        public_key = init_data.get("public_key")
+        
+        if username:
+            CLIENTS[username] = {
+                "ws": websocket,
+                "public_key": public_key
+            }
+            print(f"[+] '{username}' sunucuya başarıyla bağlandı.")
 
-        clients[username] = {"socket": conn, "pub_key": pub_key_pem}
-        print(f"[+] '{username}' bağlandı ({addr[0]})")
+        # 2. İstemciden gelen mesajları dinle
+        async for message in websocket:
+            msg_obj = json.loads(message)
+            msg_type = msg_obj.get("type")
 
-        while True:
-            data = conn.recv(8192).decode('utf-8')
-            if not data:
-                break
-            
-            msg_obj = json.loads(data)
-            action = msg_obj.get("action")
-
-            # A. Aktif Kullanıcı Listesini Gönder
-            if action == "get_users":
-                user_list = {u: info["pub_key"] for u, info in clients.items() if u != username}
-                conn.send(json.dumps({"action": "user_list", "users": user_list}).encode('utf-8'))
-
-            # B. Mesaj Yönlendir (Kör Aktarım)
-            elif action == "send_msg":
-                target = msg_obj["target"]
-                if target in clients:
-                    target_sock = clients[target]["socket"]
-                    forward_payload = json.dumps({
-                        "action": "incoming_msg",
-                        "sender": username,
-                        "encrypted_payload": msg_obj["encrypted_payload"]
+            # Kullanıcı başka birinin Public Key'ini istediğinde
+            if msg_type == "get_key":
+                target = msg_obj.get("target")
+                if target in CLIENTS:
+                    res = json.dumps({
+                        "type": "key_response",
+                        "username": target,
+                        "public_key": CLIENTS[target]["public_key"]
                     })
-                    target_sock.send(forward_payload.encode('utf-8'))
+                    await websocket.send(res)
+                else:
+                    res = json.dumps({
+                        "type": "error",
+                        "message": f"'{target}' adında bir kullanıcı bulunamadı."
+                    })
+                    await websocket.send(res)
 
-    except Exception:
+            # Şifrelenmiş mesajı hedef kişiye ilet
+            elif msg_type == "msg":
+                target = msg_obj.get("target")
+                if target in CLIENTS:
+                    await CLIENTS[target]["ws"].send(message)
+
+    except websockets.exceptions.ConnectionClosed:
         pass
+    except Exception as e:
+        print(f"[-] Hata ({username}): {e}")
     finally:
-        if username and username in clients:
-            del clients[username]
+        if username and username in CLIENTS:
+            del CLIENTS[username]
             print(f"[-] '{username}' ayrıldı.")
-        conn.close()
 
-def main():
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.bind(("0.0.0.0", 5000))
-    server.bind_time = True
-    server.listen(10)
-    print("=== GİZLİ REHBER SUNUCUSU BÖLGESİ DİNLENİYOR (PORT 5000) ===")
-
-    while True:
-        conn, addr = server.accept()
-        threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
+async def main():
+    # Render'ın atadığı portu al
+    port = int(os.environ.get("PORT", 10000))
+    print(f"=== GİZLİ REHBER WEBSOCKET SUNUCUSU BAŞLATILIYOR (PORT {port}) ===")
+    
+    async with websockets.serve(handler, "0.0.0.0", port):
+        await asyncio.Future()  # Sunucuyu sürekli açık tutar
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
