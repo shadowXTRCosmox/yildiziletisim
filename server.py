@@ -4,12 +4,13 @@ import os
 import psycopg2
 import websockets
 
-# --- VERİTABANI BAĞLANTISI (Render Environment Variables üzerinden okunur) ---
-DATABASE_URL = "postgresql://postgres.qbpnqccxvacbgcaioizf:emir8514%2112@aws-0-ap-northeast-1.pooler.supabase.co:6543/postgres"
+# --- VERİTABANI BAĞLANTISI ---
+DATABASE_URL = os.environ.get("DATABASE_URL") or "postgresql://postgres.qbpnqccxvacbgcaioizf:emir8514%2112@aws-0-ap-northeast-1.pooler.supabase.com:6543/postgres"
 
 conn = psycopg2.connect(DATABASE_URL)
 cursor = conn.cursor()
 
+# Gerekli tüm tabloları eksiksiz oluşturuyoruz
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS users (
         username TEXT PRIMARY KEY,
@@ -91,6 +92,7 @@ async def handler(websocket):
                         "theme": db_theme
                     }))
                     
+                    # Kullanıcı listeleri ve arkadaşlıkları derleyip gönderiyoruz
                     cursor.execute("SELECT username FROM users")
                     users = [row[0] for row in cursor.fetchall()]
 
@@ -149,12 +151,44 @@ async def handler(websocket):
 
             elif msg_type == "friend_request":
                 target = data.get("target")
+                if not current_user or not target:
+                    continue
+
+                # Hedef kullanıcının anahtarının (public_key) veritabanında olup olmadığını kontrol ediyoruz
+                cursor.execute("SELECT public_key FROM users WHERE username = %s", (target,))
+                target_user_data = cursor.fetchone()
+
+                if not target_user_data or not target_user_data[0]:
+                    # Anahtar yoksa isteği engelle ve hata mesajı dön
+                    await websocket.send(json.dumps({
+                        "status": "error",
+                        "message": f"'{target}' adlı kullanıcının şifreleme anahtarı bulunamadığı için arkadaşlık isteği gönderilemedi!"
+                    }))
+                    continue
+
+                # Daha önceden arkadaşlık veya istek var mı kontrolü
                 cursor.execute("SELECT * FROM friends WHERE (user1=%s AND user2=%s) OR (user1=%s AND user2=%s)", (current_user, target, target, current_user))
                 if not cursor.fetchone():
                     cursor.execute("INSERT INTO friends (user1, user2, status) VALUES (%s, %s, 'pending')", (current_user, target))
                     conn.commit()
+                    
+                    # Başarılı mesajı gönderene ilet
+                    await websocket.send(json.dumps({
+                        "status": "success",
+                        "message": f"'{target}' adlı kişiye arkadaşlık isteği gönderildi."
+                    }))
+
+                    # Eğer hedef kullanıcı çevrimiçiyse anlık bildir
                     if target in connected_clients:
-                        await connected_clients[target].send(json.dumps({"type": "friend_request_received", "sender": current_user}))
+                        await connected_clients[target].send(json.dumps({
+                            "type": "friend_request_received", 
+                            "sender": current_user
+                        }))
+                else:
+                    await websocket.send(json.dumps({
+                        "status": "error",
+                        "message": "Bu kullanıcıyla zaten arkadaşsınız veya bekleyen bir isteğiniz var."
+                    }))
 
             elif msg_type == "accept_friend":
                 sender = data.get("sender")
@@ -164,6 +198,7 @@ async def handler(websocket):
                 )
                 conn.commit()
 
+                # Her iki kullanıcının da arayüzünü güncel listelerle tazeliyoruz
                 for u in [current_user, sender]:
                     if u in connected_clients:
                         curr_ws = connected_clients[u]
@@ -244,7 +279,8 @@ async def handler(websocket):
             del connected_clients[current_user]
 
 async def main():
-    async with websockets.serve(handler, "0.0.0.0", 8765):
+    port = int(os.environ.get("PORT", 8765))
+    async with websockets.serve(handler, "0.0.0.0", port):
         await asyncio.Future()
 
 if __name__ == "__main__":
