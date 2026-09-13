@@ -8,10 +8,9 @@ import websockets
 DATABASE_URL = os.environ.get("DATABASE_URL") or "postgresql://postgres.qbpnqccxvacbgcaioizf:emir8514%2112@aws-0-ap-northeast-1.pooler.supabase.com:6543/postgres"
 
 conn = psycopg2.connect(DATABASE_URL)
-conn.autocommit = True  # Havuz (pooler) üzerindeki read-only işlem kısıtlamasını kaldırır
+conn.autocommit = True  
 cursor = conn.cursor()
 
-# Gerekli tüm tabloları eksiksiz oluşturuyoruz
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS users (
         username TEXT PRIMARY KEY,
@@ -43,18 +42,24 @@ cursor.execute("""
     )
 """)
 
+# Bağlı olan kullanıcıları tutar: {username: {"websocket": ws, "avatar": av, "color": col, "bio": bi}}
 connected_clients = {}
 
-# Tüm çevrimiçi kullanıcılara güncel kullanıcı/arkadaş listesini gönderen fonksiyon
 async def broadcast_user_lists():
     if not connected_clients:
         return
     
-    for username, ws in list(connected_clients.items()):
-        try:
-            cursor.execute("SELECT username FROM users")
-            users = [row[0] for row in cursor.fetchall()]
+    # Anlık online kullanıcıların listesi ve detayları
+    online_users = list(connected_clients.keys())
+    avatars = {u: info["avatar"] for u, info in connected_clients.items()}
+    colors = {u: info["color"] for u, info in connected_clients.items()}
+    bios = {u: info["bio"] for u, info in connected_clients.items()}
 
+    for username, info in list(connected_clients.items()):
+        try:
+            ws = info["websocket"]
+
+            # Arkadaşlıklar veritabanından çekilir (arkadaş listesi kalıcıdır)
             cursor.execute("SELECT user1, user2 FROM friends WHERE (user1 = %s OR user2 = %s) AND status = 'accepted'", (username, username))
             friends = []
             for u1, u2 in cursor.fetchall():
@@ -63,16 +68,9 @@ async def broadcast_user_lists():
             cursor.execute("SELECT user1 FROM friends WHERE user2 = %s AND status = 'pending'", (username,))
             requests = [row[0] for row in cursor.fetchall()]
 
-            cursor.execute("SELECT username, avatar, color, bio FROM users")
-            avatars, colors, bios = {}, {}, {}
-            for u, av, col, bi in cursor.fetchall():
-                avatars[u] = av
-                colors[u] = col
-                bios[u] = bi
-
             response = {
                 "type": "user_list_response",
-                "users": users,
+                "users": online_users,  # Artık sadece anlık bağlı olanlar gitmiş oluyor
                 "friends": friends,
                 "requests": requests,
                 "avatars": avatars,
@@ -114,11 +112,18 @@ async def handler(websocket):
                 user = cursor.fetchone()
                 if user:
                     current_user = username
-                    connected_clients[current_user] = websocket
                     
                     cursor.execute("SELECT color, avatar, bio, theme FROM users WHERE username = %s", (current_user,))
                     u_data = cursor.fetchone()
                     db_color, db_avatar, db_bio, db_theme = u_data if u_data else ("#89b4fa", "", "", "Mavi Tonları (Varsayılan)")
+
+                    # Kullanıcıyı anlık bağlılar listesine detaylarıyla ekliyoruz
+                    connected_clients[current_user] = {
+                        "websocket": websocket,
+                        "avatar": db_avatar,
+                        "color": db_color,
+                        "bio": db_bio
+                    }
 
                     await websocket.send(json.dumps({
                         "status": "success", 
@@ -135,8 +140,11 @@ async def handler(websocket):
 
             elif msg_type == "get_users":
                 if not current_user: continue
-                cursor.execute("SELECT username FROM users")
-                users = [row[0] for row in cursor.fetchall()]
+                
+                online_users = list(connected_clients.keys())
+                avatars = {u: info["avatar"] for u, info in connected_clients.items()}
+                colors = {u: info["color"] for u, info in connected_clients.items()}
+                bios = {u: info["bio"] for u, info in connected_clients.items()}
 
                 cursor.execute("SELECT user1, user2 FROM friends WHERE (user1 = %s OR user2 = %s) AND status = 'accepted'", (current_user, current_user))
                 friends = []
@@ -146,15 +154,8 @@ async def handler(websocket):
                 cursor.execute("SELECT user1 FROM friends WHERE user2 = %s AND status = 'pending'", (current_user,))
                 requests = [row[0] for row in cursor.fetchall()]
 
-                cursor.execute("SELECT username, avatar, color, bio FROM users")
-                avatars, colors, bios = {}, {}, {}
-                for u, av, col, bi in cursor.fetchall():
-                    avatars[u] = av
-                    colors[u] = col
-                    bios[u] = bi
-
                 await websocket.send(json.dumps({
-                    "type": "user_list_response", "users": users, "friends": friends, "requests": requests,
+                    "type": "user_list_response", "users": online_users, "friends": friends, "requests": requests,
                     "avatars": avatars, "colors": colors, "bios": bios
                 }))
 
@@ -183,7 +184,7 @@ async def handler(websocket):
                     }))
 
                     if target in connected_clients:
-                        await connected_clients[target].send(json.dumps({
+                        await connected_clients[target]["websocket"].send(json.dumps({
                             "type": "friend_request_received", 
                             "sender": current_user
                         }))
@@ -200,44 +201,6 @@ async def handler(websocket):
                     "UPDATE friends SET status = 'accepted' WHERE user1 = %s AND user2 = %s",
                     (sender, current_user),
                 )
-                
-                for u in [current_user, sender]:
-                    if u in connected_clients:
-                        curr_ws = connected_clients[u]
-                        cursor.execute("SELECT username FROM users")
-                        users = [row[0] for row in cursor.fetchall()]
-
-                        cursor.execute(
-                            "SELECT user1, user2 FROM friends WHERE (user1 = %s OR user2 = %s) AND status = 'accepted'",
-                            (u, u),
-                        )
-                        friends = []
-                        for u1, u2 in cursor.fetchall():
-                            friends.append(u2 if u1 == u else u1)
-
-                        cursor.execute(
-                            "SELECT user1 FROM friends WHERE user2 = %s AND status = 'pending'",
-                            (u,),
-                        )
-                        requests = [row[0] for row in cursor.fetchall()]
-
-                        cursor.execute("SELECT username, avatar, color, bio FROM users")
-                        avatars, colors, bios = {}, {}, {}
-                        for usr, av, col, bi in cursor.fetchall():
-                            avatars[usr] = av
-                            colors[usr] = col
-                            bios[usr] = bi
-
-                        response = {
-                            "type": "user_list_response",
-                            "users": users,
-                            "friends": friends,
-                            "requests": requests,
-                            "avatars": avatars,
-                            "colors": colors,
-                            "bios": bios,
-                        }
-                        asyncio.create_task(curr_ws.send(json.dumps(response)))
                 asyncio.create_task(broadcast_user_lists())
 
             elif msg_type == "reject_friend":
@@ -250,11 +213,23 @@ async def handler(websocket):
                 avatar = data.get("avatar", "")
                 color = data.get("color", "")
                 theme = data.get("theme", "")
+                
                 cursor.execute("UPDATE users SET bio=%s, avatar=%s, color=%s, theme=%s WHERE username=%s", (bio, avatar, color, theme, current_user))
+                
+                # Eğer kullanıcı bağlıysa anlık bellek verisini de güncelleyelim ki listede hemen yansısın
+                if current_user in connected_clients:
+                    connected_clients[current_user]["bio"] = bio
+                    connected_clients[current_user]["avatar"] = avatar
+                    connected_clients[current_user]["color"] = color
+
                 asyncio.create_task(broadcast_user_lists())
 
             elif msg_type == "get_key":
                 target = data.get("target")
+                # Önce çevrimiçi belleğe bakalım, yoksa veritabanından çekelim
+                if target in connected_clients:
+                    # Online kullanıcıların public key'i veritabanında vardır, hızlıca veritabanından çekebiliriz
+                    pass
                 cursor.execute("SELECT public_key FROM users WHERE username = %s", (target,))
                 res = cursor.fetchone()
                 if res:
@@ -272,7 +247,7 @@ async def handler(websocket):
                               (sender, target, enc_key, nonce, ciphertext, color))
 
                 if target in connected_clients:
-                    await connected_clients[target].send(message)
+                    await connected_clients[target]["websocket"].send(message)
 
     except websockets.exceptions.ConnectionClosed:
         pass
