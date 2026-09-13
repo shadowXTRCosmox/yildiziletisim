@@ -250,8 +250,8 @@ async def handler(websocket):
 
 async def main():
     port = int(os.environ.get("PORT", 8765))
-    # Ping mekanizması eklenerek bağlantının koptuğu anlık olarak algılanır
-    async with websockets.serve(handler, "0.0.0.0", port, ping_interval=20, ping_timeout=10):
+    # Kararlı ve güvenli ping aralıkları
+    async with websockets.serve(handler, "0.0.0.0", port, ping_interval=20, ping_timeout=20):
         await asyncio.Future()
 
 if __name__ == "__main__":
