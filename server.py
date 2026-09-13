@@ -54,7 +54,6 @@ async def broadcast_user_lists():
     colors = {u: info["color"] for u, info in connected_clients.items()}
     bios = {u: info["bio"] for u, info in connected_clients.items()}
 
-    # Bağlı olan HERKESE güncel listeyi gönder
     for username, info in list(connected_clients.items()):
         try:
             ws = info["websocket"]
@@ -247,12 +246,12 @@ async def handler(websocket):
     finally:
         if current_user and current_user in connected_clients:
             del connected_clients[current_user]
-            # Kullanıcı listeden silindikten hemen sonra kalanlara güncel listeyi fırlatıyoruz
             await broadcast_user_lists()
 
 async def main():
     port = int(os.environ.get("PORT", 8765))
-    async with websockets.serve(handler, "0.0.0.0", port):
+    # Ping mekanizması eklenerek bağlantının koptuğu anlık olarak algılanır
+    async with websockets.serve(handler, "0.0.0.0", port, ping_interval=20, ping_timeout=10):
         await asyncio.Future()
 
 if __name__ == "__main__":
