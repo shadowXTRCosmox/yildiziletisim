@@ -42,9 +42,46 @@ cursor.execute("""
         status TEXT
     )
 """)
-conn.commit()
 
 connected_clients = {}
+
+# Tüm çevrimiçi kullanıcılara güncel kullanıcı/arkadaş listesini gönderen fonksiyon
+async def broadcast_user_lists():
+    if not connected_clients:
+        return
+    
+    for username, ws in list(connected_clients.items()):
+        try:
+            cursor.execute("SELECT username FROM users")
+            users = [row[0] for row in cursor.fetchall()]
+
+            cursor.execute("SELECT user1, user2 FROM friends WHERE (user1 = %s OR user2 = %s) AND status = 'accepted'", (username, username))
+            friends = []
+            for u1, u2 in cursor.fetchall():
+                friends.append(u2 if u1 == username else u1)
+
+            cursor.execute("SELECT user1 FROM friends WHERE user2 = %s AND status = 'pending'", (username,))
+            requests = [row[0] for row in cursor.fetchall()]
+
+            cursor.execute("SELECT username, avatar, color, bio FROM users")
+            avatars, colors, bios = {}, {}, {}
+            for u, av, col, bi in cursor.fetchall():
+                avatars[u] = av
+                colors[u] = col
+                bios[u] = bi
+
+            response = {
+                "type": "user_list_response",
+                "users": users,
+                "friends": friends,
+                "requests": requests,
+                "avatars": avatars,
+                "colors": colors,
+                "bios": bios,
+            }
+            await ws.send(json.dumps(response))
+        except Exception:
+            pass
 
 async def handler(websocket):
     current_user = None
@@ -67,7 +104,6 @@ async def handler(websocket):
                     await websocket.send(json.dumps({"status": "error", "message": "Bu kullanıcı adı zaten alınmış!"}))
                 else:
                     cursor.execute("INSERT INTO users VALUES (%s, %s, %s, %s, %s, %s, %s)", (username, password, public_key, color, avatar, bio, theme))
-                    conn.commit()
                     await websocket.send(json.dumps({"status": "success", "message": "Kayıt başarılı!"}))
 
             elif msg_type == "login":
@@ -93,35 +129,7 @@ async def handler(websocket):
                         "theme": db_theme
                     }))
                     
-                    # Kullanıcı listeleri ve arkadaşlıkları derleyip gönderiyoruz
-                    cursor.execute("SELECT username FROM users")
-                    users = [row[0] for row in cursor.fetchall()]
-
-                    cursor.execute("SELECT user1, user2 FROM friends WHERE (user1 = %s OR user2 = %s) AND status = 'accepted'", (current_user, current_user))
-                    friends = []
-                    for u1, u2 in cursor.fetchall():
-                        friends.append(u2 if u1 == current_user else u1)
-
-                    cursor.execute("SELECT user1 FROM friends WHERE user2 = %s AND status = 'pending'", (current_user,))
-                    requests = [row[0] for row in cursor.fetchall()]
-
-                    cursor.execute("SELECT username, avatar, color, bio FROM users")
-                    avatars, colors, bios = {}, {}, {}
-                    for u, av, col, bi in cursor.fetchall():
-                        avatars[u] = av
-                        colors[u] = col
-                        bios[u] = bi
-
-                    response = {
-                        "type": "user_list_response",
-                        "users": users,
-                        "friends": friends,
-                        "requests": requests,
-                        "avatars": avatars,
-                        "colors": colors,
-                        "bios": bios,
-                    }
-                    await websocket.send(json.dumps(response))
+                    asyncio.create_task(broadcast_user_lists())
                 else:
                     await websocket.send(json.dumps({"status": "error", "message": "Geçersiz kullanıcı adı veya şifre!"}))
 
@@ -155,36 +163,31 @@ async def handler(websocket):
                 if not current_user or not target:
                     continue
 
-                # Hedef kullanıcının anahtarının (public_key) veritabanında olup olmadığını kontrol ediyoruz
                 cursor.execute("SELECT public_key FROM users WHERE username = %s", (target,))
                 target_user_data = cursor.fetchone()
 
                 if not target_user_data or not target_user_data[0]:
-                    # Anahtar yoksa isteği engelle ve hata mesajı dön
                     await websocket.send(json.dumps({
                         "status": "error",
                         "message": f"'{target}' adlı kullanıcının şifreleme anahtarı bulunamadığı için arkadaşlık isteği gönderilemedi!"
                     }))
                     continue
 
-                # Daha önceden arkadaşlık veya istek var mı kontrolü
                 cursor.execute("SELECT * FROM friends WHERE (user1=%s AND user2=%s) OR (user1=%s AND user2=%s)", (current_user, target, target, current_user))
                 if not cursor.fetchone():
                     cursor.execute("INSERT INTO friends (user1, user2, status) VALUES (%s, %s, 'pending')", (current_user, target))
-                    conn.commit()
                     
-                    # Başarılı mesajı gönderene ilet
                     await websocket.send(json.dumps({
                         "status": "success",
                         "message": f"'{target}' adlı kişiye arkadaşlık isteği gönderildi."
                     }))
 
-                    # Eğer hedef kullanıcı çevrimiçiyse anlık bildir
                     if target in connected_clients:
                         await connected_clients[target].send(json.dumps({
                             "type": "friend_request_received", 
                             "sender": current_user
                         }))
+                    asyncio.create_task(broadcast_user_lists())
                 else:
                     await websocket.send(json.dumps({
                         "status": "error",
@@ -197,9 +200,7 @@ async def handler(websocket):
                     "UPDATE friends SET status = 'accepted' WHERE user1 = %s AND user2 = %s",
                     (sender, current_user),
                 )
-                conn.commit()
-
-                # Her iki kullanıcının da arayüzünü güncel listelerle tazeliyoruz
+                
                 for u in [current_user, sender]:
                     if u in connected_clients:
                         curr_ws = connected_clients[u]
@@ -237,11 +238,12 @@ async def handler(websocket):
                             "bios": bios,
                         }
                         asyncio.create_task(curr_ws.send(json.dumps(response)))
+                asyncio.create_task(broadcast_user_lists())
 
             elif msg_type == "reject_friend":
                 sender = data.get("sender")
                 cursor.execute("DELETE FROM friends WHERE user1 = %s AND user2 = %s", (sender, current_user))
-                conn.commit()
+                asyncio.create_task(broadcast_user_lists())
 
             elif msg_type == "update_profile":
                 bio = data.get("bio", "")
@@ -249,7 +251,7 @@ async def handler(websocket):
                 color = data.get("color", "")
                 theme = data.get("theme", "")
                 cursor.execute("UPDATE users SET bio=%s, avatar=%s, color=%s, theme=%s WHERE username=%s", (bio, avatar, color, theme, current_user))
-                conn.commit()
+                asyncio.create_task(broadcast_user_lists())
 
             elif msg_type == "get_key":
                 target = data.get("target")
@@ -267,8 +269,7 @@ async def handler(websocket):
                 color = data.get("color")
 
                 cursor.execute("INSERT INTO messages (sender, target, encrypted_key, nonce, ciphertext, color) VALUES (%s, %s, %s, %s, %s, %s)", 
-                               (sender, target, enc_key, nonce, ciphertext, color))
-                conn.commit()
+                              (sender, target, enc_key, nonce, ciphertext, color))
 
                 if target in connected_clients:
                     await connected_clients[target].send(message)
@@ -278,6 +279,7 @@ async def handler(websocket):
     finally:
         if current_user and current_user in connected_clients:
             del connected_clients[current_user]
+            asyncio.create_task(broadcast_user_lists())
 
 async def main():
     port = int(os.environ.get("PORT", 8765))
