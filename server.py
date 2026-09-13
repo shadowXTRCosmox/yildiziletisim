@@ -49,17 +49,16 @@ async def broadcast_user_lists():
     if not connected_clients:
         return
     
-    # Anlık online kullanıcıların listesi ve detayları
     online_users = list(connected_clients.keys())
     avatars = {u: info["avatar"] for u, info in connected_clients.items()}
     colors = {u: info["color"] for u, info in connected_clients.items()}
     bios = {u: info["bio"] for u, info in connected_clients.items()}
 
+    # Bağlı olan HERKESE güncel listeyi gönder
     for username, info in list(connected_clients.items()):
         try:
             ws = info["websocket"]
 
-            # Arkadaşlıklar veritabanından çekilir (arkadaş listesi kalıcıdır)
             cursor.execute("SELECT user1, user2 FROM friends WHERE (user1 = %s OR user2 = %s) AND status = 'accepted'", (username, username))
             friends = []
             for u1, u2 in cursor.fetchall():
@@ -70,7 +69,7 @@ async def broadcast_user_lists():
 
             response = {
                 "type": "user_list_response",
-                "users": online_users,  # Artık sadece anlık bağlı olanlar gitmiş oluyor
+                "users": online_users,
                 "friends": friends,
                 "requests": requests,
                 "avatars": avatars,
@@ -117,7 +116,6 @@ async def handler(websocket):
                     u_data = cursor.fetchone()
                     db_color, db_avatar, db_bio, db_theme = u_data if u_data else ("#89b4fa", "", "", "Mavi Tonları (Varsayılan)")
 
-                    # Kullanıcıyı anlık bağlılar listesine detaylarıyla ekliyoruz
                     connected_clients[current_user] = {
                         "websocket": websocket,
                         "avatar": db_avatar,
@@ -134,7 +132,7 @@ async def handler(websocket):
                         "theme": db_theme
                     }))
                     
-                    asyncio.create_task(broadcast_user_lists())
+                    await broadcast_user_lists()
                 else:
                     await websocket.send(json.dumps({"status": "error", "message": "Geçersiz kullanıcı adı veya şifre!"}))
 
@@ -188,7 +186,7 @@ async def handler(websocket):
                             "type": "friend_request_received", 
                             "sender": current_user
                         }))
-                    asyncio.create_task(broadcast_user_lists())
+                    await broadcast_user_lists()
                 else:
                     await websocket.send(json.dumps({
                         "status": "error",
@@ -201,12 +199,12 @@ async def handler(websocket):
                     "UPDATE friends SET status = 'accepted' WHERE user1 = %s AND user2 = %s",
                     (sender, current_user),
                 )
-                asyncio.create_task(broadcast_user_lists())
+                await broadcast_user_lists()
 
             elif msg_type == "reject_friend":
                 sender = data.get("sender")
                 cursor.execute("DELETE FROM friends WHERE user1 = %s AND user2 = %s", (sender, current_user))
-                asyncio.create_task(broadcast_user_lists())
+                await broadcast_user_lists()
 
             elif msg_type == "update_profile":
                 bio = data.get("bio", "")
@@ -216,20 +214,15 @@ async def handler(websocket):
                 
                 cursor.execute("UPDATE users SET bio=%s, avatar=%s, color=%s, theme=%s WHERE username=%s", (bio, avatar, color, theme, current_user))
                 
-                # Eğer kullanıcı bağlıysa anlık bellek verisini de güncelleyelim ki listede hemen yansısın
                 if current_user in connected_clients:
                     connected_clients[current_user]["bio"] = bio
                     connected_clients[current_user]["avatar"] = avatar
                     connected_clients[current_user]["color"] = color
 
-                asyncio.create_task(broadcast_user_lists())
+                await broadcast_user_lists()
 
             elif msg_type == "get_key":
                 target = data.get("target")
-                # Önce çevrimiçi belleğe bakalım, yoksa veritabanından çekelim
-                if target in connected_clients:
-                    # Online kullanıcıların public key'i veritabanında vardır, hızlıca veritabanından çekebiliriz
-                    pass
                 cursor.execute("SELECT public_key FROM users WHERE username = %s", (target,))
                 res = cursor.fetchone()
                 if res:
@@ -254,7 +247,8 @@ async def handler(websocket):
     finally:
         if current_user and current_user in connected_clients:
             del connected_clients[current_user]
-            asyncio.create_task(broadcast_user_lists())
+            # Kullanıcı listeden silindikten hemen sonra kalanlara güncel listeyi fırlatıyoruz
+            await broadcast_user_lists()
 
 async def main():
     port = int(os.environ.get("PORT", 8765))
