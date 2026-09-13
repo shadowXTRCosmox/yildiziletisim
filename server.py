@@ -5,7 +5,7 @@ import psycopg2
 import websockets
 
 # --- VERİTABANI BAĞLANTISI ---
-DATABASE_URL = os.environ.get("DATABASE_URL") or "postgresql://postgres.qbpnqccxvacbgcaioizf:emir8514%2112@aws-0-ap-northeast-1.pooler.supabase.com:6543/postgres"
+DATABASE_URL = "postgresql://postgres.qbpnqccxvacbgcaioizf:emir8514%2112@aws-0-ap-northeast-1.pooler.supabase.com:6543/postgres"
 
 conn = psycopg2.connect(DATABASE_URL)
 cursor = conn.cursor()
